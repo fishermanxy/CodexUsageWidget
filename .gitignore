@@ -1,0 +1,16 @@
+# 虚拟环境
+.venv/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# PyInstaller 产物
+build/
+dist/
+
+# 运行时状态（含本机用户路径，自动生成）
+widget-state.json
+
+# IDE
+.vscode/

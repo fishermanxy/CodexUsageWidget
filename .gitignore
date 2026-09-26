@@ -14,3 +14,7 @@ widget-state.json
 
 # IDE
 .vscode/
+.trae/
+
+# 调试记录
+debug-widget-data-vanish.md

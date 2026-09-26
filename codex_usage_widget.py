@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QPoint, Qt, QTimer
+from PySide6.QtCore import QFileSystemWatcher, QPoint, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QCursor, QFont, QMouseEvent
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel,
@@ -28,10 +28,14 @@ from PySide6.QtWidgets import (
 
 APP_NAME = "Codex Usage Widget"
 STATE_FILE = "widget-state.json"
-POLL_MS = 3_000
-TICK_MS = 1_000
 USAGE_THROTTLE_MS = 30_000
+WATCH_DEBOUNCE_MS = 250
+WATCH_HEALTH_MS = 5 * 60_000
+RESET_CREDIT_CACHE = "reset-credit-details-cache.json"
+RESET_CREDIT_SCHEMA_VERSION = 1
+RESET_CREDIT_PRODUCER_VERSION = "2.60.0"
 REQUIRED_FILES = ("codex-quota-cache.json", "config.json", "usage.jsonl")
+WATCHED_FILES = (*REQUIRED_FILES, RESET_CREDIT_CACHE)
 
 DEFAULT_SIZE = (400, 250)
 MIN_SIZE = (280, 170)
@@ -119,6 +123,15 @@ def normalize_ts(v: Any) -> Optional[float]:
     return f / 1000.0 if f > 1e12 else f
 
 
+def is_free_plan(plan: Any) -> bool:
+    return isinstance(plan, str) and plan.strip().lower() == "free"
+
+
+def account_key(value: Any) -> str:
+    """Normalize account identifiers before comparing config and cache values."""
+    return str(value or "").strip().casefold()
+
+
 def today_midnight_ts() -> float:
     now = datetime.now().astimezone()
     return now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
@@ -133,17 +146,99 @@ def human_bytes(n: int) -> str:
 
 
 def human_dur(seconds: float) -> str:
-    if seconds < 60:
-        return f"{int(seconds)}s"
-    m, s = divmod(int(seconds), 60)
-    if m < 60:
-        return f"{m}m {s}s"
-    h, m = divmod(m, 60)
-    if h < 24:
-        return f"{h}h {m}m"
-    d, h = divmod(h, 24)
-    return f"{d}d {h}h"
+    """A stable, adaptive relative duration suitable for low-frequency repainting."""
+    remaining = max(0, int(seconds))
+    if remaining >= 24 * 3600:
+        return f"{(remaining + 24 * 3600 - 1) // (24 * 3600)} 天后"
+    if remaining >= 3600:
+        return f"{(remaining + 3600 - 1) // 3600} 小时后"
+    if remaining >= 60:
+        return f"{(remaining + 59) // 60} 分钟后"
+    return f"{remaining} 秒后"
 
+
+def countdown_refresh_delay(seconds: float) -> int:
+    """Milliseconds until the next visible adaptive-duration change."""
+    remaining = max(0, seconds)
+    if remaining < 60:
+        return 1_000
+    unit = 60 if remaining < 3600 else 3600 if remaining < 24 * 3600 else 24 * 3600
+    remainder = remaining % unit
+    return max(1_000, int((remainder if remainder > 0 else unit) * 1000) + 50)
+
+
+def normalize_datetime(v: Any) -> Optional[float]:
+    """Accept Unix timestamps or the ISO timestamps emitted by OpenCodex' safe cache."""
+    normalized = normalize_ts(v)
+    if normalized is not None:
+        return normalized
+    if not isinstance(v, str) or not v.strip():
+        return None
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def format_credit_expiry(expires_at: Optional[float], now: Optional[float] = None) -> str:
+    if expires_at is None:
+        return "到期信息暂不可用"
+    now = time.time() if now is None else now
+    if expires_at <= now:
+        return "已到期"
+    date = datetime.fromtimestamp(expires_at).strftime("%Y年%m月%d日")
+    return f"到期：{date}（{human_dur(expires_at - now)}）"
+
+
+def format_credit_expiry_parts(expires_at: Optional[float], now: Optional[float] = None) -> Tuple[str, str]:
+    """Return the absolute date and remaining time as separate UI fields."""
+    if expires_at is None:
+        return "到期信息暂不可用", ""
+    now = time.time() if now is None else now
+    if expires_at <= now:
+        return "已到期", ""
+    date = datetime.fromtimestamp(expires_at).strftime("%Y年%m月%d日")
+    return date, human_dur(expires_at - now)
+
+
+def reset_countdown(reset_ts: Optional[float], period: int, now: Optional[float] = None) -> str:
+    """Format a reset countdown, rolling expired recurring windows forward."""
+    if reset_ts is None:
+        return "重置 —"
+    now = time.time() if now is None else now
+    next_reset = reset_ts
+    if next_reset <= now and period > 0:
+        periods_elapsed = int((now - next_reset) // period) + 1
+        next_reset += periods_elapsed * period
+    remaining = next_reset - now
+    return "重置 —" if remaining <= 0 else f"重置 {human_dur(remaining)}"
+
+
+def format_reset_credits(value: Any, credits: Optional[List[Dict[str, Any]]] = None) -> str:
+    try:
+        count = max(0, int(value or 0))
+    except (TypeError, ValueError):
+        count = 0
+    if not count:
+        return "重置额度：暂无"
+    earliest = min(
+        (item.get("expires_at") for item in (credits or []) if item.get("expires_at") is not None),
+        default=None,
+    )
+    return f"重置额度：{count} 次 · {format_credit_expiry(earliest)}"
+
+
+def format_reset_credit_status(
+    updated_at: Optional[float], failed_at: Optional[float], notice: str = ""
+) -> str:
+    """Describe cache freshness without implying that the widget queried upstream."""
+    if notice:
+        return f"提示：{notice}"
+    if failed_at is not None and (updated_at is None or failed_at >= updated_at):
+        return f"详情同步失败 {datetime.fromtimestamp(failed_at).strftime('%m-%d %H:%M')} · 保留上次有效内容"
+    if updated_at is not None:
+        return f"最近同步 {datetime.fromtimestamp(updated_at).strftime('%m-%d %H:%M')}"
+    return "详情尚未同步"
 
 # ──────────────────────────────── 数据目录自动发现 ────────────────────────────────
 
@@ -220,9 +315,21 @@ class DataStore:
         self._mtimes: Dict[str, float] = {}
         self._cache: Dict[str, Any] = {}
         self._usage_offset: int = 0
+        self._usage_file_marker: Optional[Tuple[int, int]] = None
+        self._usage_rebuild_pending = False
         self._usage_day_start: float = today_midnight_ts()
-        self._today_stats = UsageStats()
+        self._today_stats: Dict[str, UsageStats] = {}
         self._last_usage_scan: float = 0.0
+
+    def invalidate(self, *names: str) -> None:
+        for name in names:
+            self._mtimes.pop(name, None)
+            if name == "usage.jsonl":
+                # QFileSystemWatcher reports atomic replacements as a change, and
+                # the replacement can be larger than the old file. Defer the
+                # rebuild until the normal throttle window expires so the UI
+                # keeps the last complete snapshot while writes settle.
+                self._usage_rebuild_pending = True
 
     def _read_json(self, name: str) -> Optional[Dict[str, Any]]:
         p = self.data_dir / name
@@ -243,6 +350,9 @@ class DataStore:
     def read_config(self) -> Optional[Dict[str, Any]]:
         return self._read_json("config.json")
 
+    def read_reset_credit_details(self) -> Optional[Dict[str, Any]]:
+        return self._read_json(RESET_CREDIT_CACHE)
+
     def _scan_usage_tail(self, force: bool = False) -> None:
         now = time.time()
         if not force and (now - self._last_usage_scan) < USAGE_THROTTLE_MS / 1000:
@@ -250,12 +360,28 @@ class DataStore:
         self._last_usage_scan = now
         p = self.data_dir / "usage.jsonl"
         try:
-            size = p.stat().st_size
+            stat = p.stat()
+            size = stat.st_size
+            marker = (getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)), size)
+            if self._usage_rebuild_pending:
+                self._today_stats = {}
+                self._usage_offset = 0
+                self._usage_file_marker = None
             day_start = today_midnight_ts()
             if day_start != self._usage_day_start:
                 self._usage_day_start = day_start
-                self._today_stats = UsageStats()
+                self._today_stats = {}
                 self._usage_offset = 0
+                self._usage_file_marker = None
+            elif self._usage_offset and (
+                size < self._usage_offset
+                or (size == self._usage_offset and marker != self._usage_file_marker)
+            ):
+                # The producer rotated or rewrote the log. Rebuild the bounded
+                # tail instead of seeking past EOF or double-counting old rows.
+                self._today_stats = {}
+                self._usage_offset = 0
+                self._usage_file_marker = None
             if self._usage_offset == 0:
                 seek_back = min(size, 2 * 1024 * 1024)
                 start_pos = size - seek_back
@@ -272,6 +398,8 @@ class DataStore:
                     for line in f:
                         self._process_line(line)
                     self._usage_offset = f.tell()
+            self._usage_rebuild_pending = False
+            self._usage_file_marker = marker
         except Exception:
             pass
 
@@ -283,16 +411,27 @@ class DataStore:
             row = json.loads(line)
         except Exception:
             return
+        if not isinstance(row, dict):
+            return
         ts = normalize_ts(row.get("timestamp"))
         if ts is None or ts < self._usage_day_start:
             return
-        if row.get("provider") != "openai":
+        provider = str(row.get("provider") or "")
+        if provider == "openai":
+            account_label = "__main__"
+        elif provider.startswith("openai-"):
+            account_label = str(row.get("accountLogLabel") or provider.removeprefix("openai-"))
+        else:
             return
-        self._today_stats.add(row)
+        self._today_stats.setdefault(account_label, UsageStats()).add(row)
 
-    def today_stats(self) -> UsageStats:
-        self._scan_usage_tail()
-        return self._today_stats
+    def today_stats(self, account_log_label: Optional[str], force: bool = False) -> UsageStats:
+        self._scan_usage_tail(force)
+        return self._today_stats.get(account_log_label or "__main__", UsageStats())
+
+    def usage_wait_ms(self) -> int:
+        elapsed_ms = int((time.time() - self._last_usage_scan) * 1000)
+        return max(0, USAGE_THROTTLE_MS - elapsed_ms)
 
     # ---------- 账号列表与快照 ----------
 
@@ -305,34 +444,110 @@ class DataStore:
         if "__main__" in quotas:
             accounts.append({"id": "__main__", "email": "主账号（原生登录）", "plan": "free"})
         # 活动账号排最前
-        active_id = config.get("activeCodexAccountPinned", "")
-        accounts.sort(key=lambda a: 0 if a.get("id") == active_id else 1)
+        active_id = (
+            config.get("activeCodexAccountId")
+            or config.get("activeCodexAccountPinned")
+            or config.get("activeCodexAccount", "")
+        )
+        active_key = account_key(active_id)
+        accounts.sort(key=lambda a: 0 if account_key(a.get("id")) == active_key else 1)
         return accounts
 
-    def snapshot(self, account_id: Optional[str] = None) -> Dict[str, Any]:
+    def usage_changed(self) -> bool:
+        try:
+            stat = (self.data_dir / "usage.jsonl").stat()
+            marker = (getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)), stat.st_size)
+            return marker != self._usage_file_marker
+        except Exception:
+            return True
+
+    def reset_credit_details(
+        self, account_id: str, count: Any
+    ) -> Tuple[List[Dict[str, Optional[float]]], Optional[float], Optional[float], bool, str]:
+        cache = self.read_reset_credit_details() or {}
+        notice = ""
+        if cache:
+            schema = cache.get("schemaVersion") if isinstance(cache, dict) else None
+            producer = cache.get("producerVersion") if isinstance(cache, dict) else None
+            if schema != RESET_CREDIT_SCHEMA_VERSION:
+                notice = "详情缓存格式不兼容"
+            elif producer != RESET_CREDIT_PRODUCER_VERSION:
+                notice = "详情缓存版本不同"
+        accounts = cache.get("accounts") if isinstance(cache, dict) else None
+        entry = accounts.get(account_id) if isinstance(accounts, dict) else None
+        if not isinstance(entry, dict):
+            return [], None, None, False, notice
+        updated_at = normalize_datetime(entry.get("updatedAt"))
+        failed_at = normalize_datetime(entry.get("lastFailureAt"))
+        try:
+            cached_count = max(0, int(entry.get("availableCount") or 0))
+        except (TypeError, ValueError):
+            cached_count = -1
+        try:
+            expected_count = max(0, int(count or 0))
+        except (TypeError, ValueError):
+            expected_count = 0
+        if cached_count != expected_count:
+            return [], updated_at, failed_at, False, notice or "详情与当前额度数量不一致，等待同步"
+        details: List[Dict[str, Optional[float]]] = []
+        for raw in entry.get("credits") or []:
+            if not isinstance(raw, dict):
+                continue
+            expires_at = normalize_datetime(raw.get("expiresAt") or raw.get("expires_at"))
+            if expires_at is None:
+                continue
+            details.append({"expires_at": expires_at, "granted_at": normalize_datetime(raw.get("grantedAt") or raw.get("granted_at"))})
+        if len(details) != expected_count:
+            return [], updated_at, failed_at, False, notice or "详情不完整，等待同步"
+        return sorted(details, key=lambda item: item["expires_at"] or float("inf")), updated_at, failed_at, True, notice
+
+    def snapshot(self, account_id: Optional[str] = None, force_usage: bool = False) -> Dict[str, Any]:
         quota = self.read_quota()
         config = self.read_config()
-        stats = self.today_stats()
+        stats: UsageStats
 
-        active_id = (config or {}).get("activeCodexAccountPinned", "")
+        active_id = (
+            (config or {}).get("activeCodexAccountId")
+            or (config or {}).get("activeCodexAccountPinned")
+            or (config or {}).get("activeCodexAccount", "")
+        )
         accounts = {a["id"]: a for a in (config or {}).get("codexAccounts", [])}
         accounts.setdefault("__main__", {"id": "__main__", "email": "主账号（原生登录）", "plan": "free"})
 
         shown_id = account_id or active_id or "__main__"
         shown = accounts.get(shown_id, {"email": "未知账号", "plan": "?"})
+        log_label = shown.get("logLabel") or shown_id
+        stats = self.today_stats(log_label, force_usage)
+        active_key = account_key(active_id)
+        shown_keys = {
+            account_key(shown_id),
+            account_key(shown.get("id")),
+            account_key(shown.get("logLabel")),
+            account_key(shown.get("email")),
+            account_key(shown.get("loginEmail")),
+        }
 
         quotas = (quota or {}).get("quotas", {})
         q = quotas.get(shown_id) or {}
+        credit_details, credit_updated, credit_failed, credit_cache_ok, credit_notice = self.reset_credit_details(
+            shown_id, q.get("resetCredits", 0)
+        )
 
         return {
             "email": shown.get("email") or "未知账号",
             "plan": shown.get("plan") or "?",
             "shown_id": shown_id,
-            "is_active": shown_id == active_id,
+            "is_active": bool(active_key and active_key in shown_keys),
             "short_percent": q.get("shortPercent", q.get("monthlyPercent", 0)),
             "short_reset": normalize_ts(q.get("shortResetAt") or q.get("monthlyResetAt")),
             "weekly_percent": q.get("weeklyPercent", 0),
             "weekly_reset": normalize_ts(q.get("weeklyResetAt")),
+            "reset_credits": q.get("resetCredits", 0),
+            "reset_credit_details": credit_details,
+            "reset_credit_updated": credit_updated,
+            "reset_credit_failed": credit_failed,
+            "reset_credit_cache_ok": credit_cache_ok,
+            "reset_credit_notice": credit_notice,
             "today": stats,
         }
 
@@ -346,6 +561,8 @@ class QuotaBar(QWidget):
         super().__init__(parent)
         self._period = period  # 窗口周期（秒），用于已过重置点后推算下次重置
         self._reset_ts: Optional[float] = None
+        self._unavailable = False
+        self._muted = ""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -369,9 +586,10 @@ class QuotaBar(QWidget):
     def apply_theme(self, t: Dict[str, Any]) -> None:
         self._accent = t["accent"]
         self._track = t["track"]
+        self._muted = t["muted"]
         self._title_label.setStyleSheet(f"color:{t['fg']}; font-weight:600; font-size:10pt; background:transparent;")
         self._reset_label.setStyleSheet(f"color:{t['muted']}; font-size:8.5pt; background:transparent;")
-        self._apply_color(self._accent)
+        self._apply_color(self._muted if self._unavailable else self._accent)
 
     def _apply_color(self, color: str) -> None:
         self._pct_label.setStyleSheet(f"color:{color}; font-weight:700; font-size:10pt; background:transparent;")
@@ -382,6 +600,8 @@ class QuotaBar(QWidget):
 
     def set_value(self, used_percent: int, reset_ts: Optional[float]) -> None:
         """传入已用百分比，界面显示剩余量；窗口已重置时显示100%"""
+        self._unavailable = False
+        self._bar.setEnabled(True)
         self._reset_ts = reset_ts
         if reset_ts is not None and reset_ts <= time.time():
             remaining = 100
@@ -396,19 +616,21 @@ class QuotaBar(QWidget):
         else:
             color = self._accent
         self._apply_color(color)
+        self.tick()
+
+    def set_unavailable(self) -> None:
+        self._unavailable = True
+        self._reset_ts = None
+        self._bar.setEnabled(False)
+        self._bar.setValue(0)
+        self._pct_label.setText("无额度")
+        self._reset_label.clear()
+        self._apply_color(self._muted)
 
     def tick(self) -> None:
-        if not self._reset_ts:
-            self._reset_label.setText("")
+        if self._unavailable:
             return
-        remain = self._reset_ts - time.time()
-        # 重置点已过：推算下一个重置点继续倒计时（5h 窗口滚动，周窗按 7 天滚动）
-        if remain <= 0 and self._period > 0:
-            nxt = self._reset_ts
-            while nxt <= time.time():
-                nxt += self._period
-            remain = nxt - time.time()
-        self._reset_label.setText("" if remain <= 0 else f"重置 {human_dur(remain)}")
+        self._reset_label.setText(reset_countdown(self._reset_ts, self._period))
 
 
 # ──────────────────────────────── 主卡片 ────────────────────────────────
@@ -424,6 +646,7 @@ class UsageCard(QMainWindow):
         self._data_dir: Optional[Path] = None
         self._store: Optional[DataStore] = None
         self._last_snap: Optional[Dict[str, Any]] = None
+        self._credit_expanded = bool(self._state.get("reset_credit_expanded", False))
 
         self._theme_key: str = self._state.get("theme", "light")
         if self._theme_key not in THEMES:
@@ -437,14 +660,22 @@ class UsageCard(QMainWindow):
         self._restore_geometry()
         self._discover_data()
 
-        self._poll_timer = QTimer(self)
-        self._poll_timer.timeout.connect(self._refresh)
-        self._poll_timer.start(POLL_MS)
-        self._tick_timer = QTimer(self)
-        self._tick_timer.timeout.connect(self._tick)
-        self._tick_timer.start(TICK_MS)
-
-        self._refresh()
+        self._watcher = QFileSystemWatcher(self)
+        self._watch_dirty: set[str] = set()
+        self._watcher.fileChanged.connect(self._on_watched_file_changed)
+        self._watcher.directoryChanged.connect(self._on_watched_directory_changed)
+        self._watch_debounce = QTimer(self)
+        self._watch_debounce.setSingleShot(True)
+        self._watch_debounce.timeout.connect(self._flush_watched_changes)
+        self._usage_deferred = QTimer(self)
+        self._usage_deferred.setSingleShot(True)
+        self._usage_deferred.timeout.connect(lambda: self._refresh(force_usage=True))
+        self._watch_health = QTimer(self)
+        self._watch_health.timeout.connect(self._configure_watchers)
+        self._watch_health.start(WATCH_HEALTH_MS)
+        self._configure_watchers()
+        self._refresh(force_usage=True)
+        self._schedule_countdown_refresh()
 
     # ---------- UI 构建 ----------
 
@@ -479,7 +710,22 @@ class UsageCard(QMainWindow):
         email_row.addWidget(self._next_btn)
         info.addLayout(email_row)
         self._plan_label = QLabel("—")
+        self._plan_label.setTextFormat(Qt.RichText)
         info.addWidget(self._plan_label)
+        self._credit_row = QHBoxLayout()
+        self._credit_summary_label = QLabel("重置额度  暂无")
+        self._credit_summary_label.setObjectName("resetCredit")
+        self._credit_row.addWidget(self._credit_summary_label, stretch=1)
+        self._credit_toggle = self._mk_icon_btn("⌄", self._toggle_credit_details)
+        self._credit_toggle.setFixedSize(18, 18)
+        self._credit_row.addWidget(self._credit_toggle)
+        info.addLayout(self._credit_row)
+        self._credit_expiry_label = QLabel("")
+        self._credit_expiry_label.setObjectName("creditExpiry")
+        info.addWidget(self._credit_expiry_label)
+        self._reset_credit_status_label = QLabel("")
+        self._reset_credit_status_label.setObjectName("resetCreditStatus")
+        info.addWidget(self._reset_credit_status_label)
         header.addLayout(info, stretch=1)
 
         self._pin_btn = self._mk_icon_btn("📌", lambda: self._toggle_pin(self._pin_btn.isChecked()))
@@ -495,6 +741,7 @@ class UsageCard(QMainWindow):
         self._big_row = QHBoxLayout()
         self._big_short = QLabel("0%")
         self._big_weekly = QLabel("0%")
+        self._big_reset_labels: List[QLabel] = []
         for lbl, name in ((self._big_short, "5h 剩余"), (self._big_weekly, "每周剩余")):
             box = QVBoxLayout()
             box.setSpacing(0)
@@ -503,13 +750,66 @@ class UsageCard(QMainWindow):
             sub.setAlignment(Qt.AlignCenter)
             sub.setObjectName("bigSub")
             box.addWidget(sub)
+            reset = QLabel("重置 —")
+            reset.setAlignment(Qt.AlignCenter)
+            reset.setObjectName("bigReset")
+            box.addWidget(reset)
+            self._big_reset_labels.append(reset)
             self._big_row.addLayout(box)
         big_wrap = QWidget()
         big_wrap.setLayout(self._big_row)
         self._big_wrap = big_wrap
         self._root.addWidget(big_wrap)
+        self._big_credit_wrap = QWidget()
+        big_credit_row = QHBoxLayout(self._big_credit_wrap)
+        big_credit_row.setContentsMargins(0, 0, 0, 0)
+        self._big_credit_label = QLabel("重置额度  暂无")
+        self._big_credit_label.setAlignment(Qt.AlignCenter)
+        self._big_credit_label.setObjectName("bigCredit")
+        big_credit_row.addWidget(self._big_credit_label, stretch=1)
+        self._big_credit_toggle = self._mk_icon_btn("⌄", self._toggle_credit_details)
+        self._big_credit_toggle.setFixedSize(18, 18)
+        big_credit_row.addWidget(self._big_credit_toggle)
+        self._root.addWidget(self._big_credit_wrap)
+        self._big_credit_expiry_label = QLabel("")
+        self._big_credit_expiry_label.setAlignment(Qt.AlignCenter)
+        self._big_credit_expiry_label.setObjectName("bigCreditExpiry")
+        self._root.addWidget(self._big_credit_expiry_label)
+        self._big_credit_status_label = QLabel("")
+        self._big_credit_status_label.setAlignment(Qt.AlignCenter)
+        self._big_credit_status_label.setObjectName("bigCreditStatus")
+        self._root.addWidget(self._big_credit_status_label)
 
-        # ── 配额进度条 ──
+        self._credit_details = QWidget()
+        credit_layout = QVBoxLayout(self._credit_details)
+        credit_layout.setContentsMargins(0, 2, 0, 2)
+        credit_layout.setSpacing(2)
+        self._credit_details_title = QLabel("额度明细")
+        self._credit_details_title.setObjectName("creditDetailsTitle")
+        credit_layout.addWidget(self._credit_details_title)
+        self._credit_detail_rows: List[Tuple[QWidget, QLabel, QLabel, QLabel]] = []
+        for index in range(5):
+            row = QWidget()
+            row.setObjectName("creditDetailRow")
+            row.setFixedHeight(20)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            number = QLabel(f"额度 {index + 1}")
+            number.setObjectName("creditDetailNumber")
+            number.setFixedWidth(40)
+            date = QLabel("")
+            date.setObjectName("creditDetailDate")
+            remaining = QLabel("")
+            remaining.setObjectName("creditDetailRemaining")
+            remaining.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            row_layout.addWidget(number)
+            row_layout.addWidget(date, stretch=1)
+            row_layout.addWidget(remaining)
+            credit_layout.addWidget(row)
+            self._credit_detail_rows.append((row, number, date, remaining))
+        self._credit_details.setVisible(False)
+        self._root.addWidget(self._credit_details)
         self._short_bar = QuotaBar("5 小时窗口剩余", period=5 * 3600)
         self._weekly_bar = QuotaBar("每周窗口剩余", period=7 * 24 * 3600)
         self._root.addWidget(self._short_bar)
@@ -614,6 +914,17 @@ class UsageCard(QMainWindow):
             #statTitle {{ color:{t['muted']}; font-size:8pt; }}
             #detailLine {{ color:{t['muted']}; font-size:8.5pt; }}
             #bigSub {{ color:{t['muted']}; font-size:9pt; }}
+            #bigReset {{ color:{t['faint']}; font-size:8.5pt; }}
+            #resetCredit {{ color:{t['muted']}; font-size:8pt; }}
+            #creditExpiry {{ color:{t['fg']}; font-size:8pt; }}
+            #resetCreditStatus {{ color:{t['faint']}; font-size:7.5pt; }}
+            #bigCredit {{ color:{t['muted']}; font-size:9pt; }}
+            #bigCreditExpiry {{ color:{t['fg']}; font-size:8.5pt; }}
+            #bigCreditStatus {{ color:{t['faint']}; font-size:7.5pt; }}
+            #creditDetailsTitle {{ color:{t['faint']}; font-size:7.5pt; font-weight:600; }}
+            #creditDetailNumber {{ color:{t['muted']}; font-size:8pt; }}
+            #creditDetailDate {{ color:{t['fg']}; font-size:8pt; }}
+            #creditDetailRemaining {{ color:{t['muted']}; font-size:8pt; }}
             QToolButton {{
                 background: transparent; border: none; border-radius: 13px;
                 color: {t['muted']}; font-size: 12px; font-weight: 700;
@@ -640,6 +951,14 @@ class UsageCard(QMainWindow):
         self._sep.setVisible(density != "compact")
         self._avatar.setVisible(density != "compact")
         self._detail.setVisible(density == "rich")
+        self._credit_summary_label.setVisible(density != "compact")
+        self._credit_toggle.setVisible(density != "compact")
+        self._credit_expiry_label.setVisible(density != "compact")
+        self._reset_credit_status_label.setVisible(density != "compact")
+        self._big_credit_wrap.setVisible(density == "compact")
+        self._big_credit_label.setVisible(True)
+        self._big_credit_expiry_label.setVisible(density == "compact")
+        self._big_credit_status_label.setVisible(density == "compact")
         for bar in (self._short_bar, self._weekly_bar):
             bar.setVisible(density != "compact")
         if density == "rich" and self.height() < 320:
@@ -648,11 +967,11 @@ class UsageCard(QMainWindow):
         # 主题切换只更新样式，不触发完整 _refresh（避免 usage 扫描/多次重绘造成卡顿）；
         # 进度条与大数字的颜色用缓存的快照立即重设
         if self._last_snap is not None:
-            self._short_bar.set_value(self._last_snap["short_percent"], self._last_snap["short_reset"])
-            self._weekly_bar.set_value(self._last_snap["weekly_percent"], self._last_snap["weekly_reset"])
-            self._update_big_numbers(self._last_snap)
+            self._update_quota_display(self._last_snap)
             self._update_detail(self._last_snap)
+            self._update_big_countdowns(self._last_snap)
 
+            self._update_reset_credits(self._last_snap)
     def _cycle_theme(self) -> None:
         i = THEME_ORDER.index(self._theme_key)
         self._theme_key = THEME_ORDER[(i + 1) % len(THEME_ORDER)]
@@ -689,6 +1008,7 @@ class UsageCard(QMainWindow):
             "size": [self.width(), self.height()],
             "account_index": self._account_index,
             "theme": self._theme_key,
+            "reset_credit_expanded": self._credit_expanded,
         }
         if self._data_dir:
             new_state["dataDir"] = str(self._data_dir)
@@ -706,6 +1026,8 @@ class UsageCard(QMainWindow):
             self._data_dir = found
             self._store = DataStore(found)
             self._status_label.setText(f"数据目录: {found.name}/")
+            if hasattr(self, "_watcher"):
+                self._configure_watchers()
             self._save_state()
         else:
             self._data_dir = None
@@ -748,7 +1070,56 @@ class UsageCard(QMainWindow):
 
     # ---------- 刷新 ----------
 
-    def _refresh(self) -> None:
+    def _configure_watchers(self) -> None:
+        if not self._data_dir:
+            return
+        directory = str(self._data_dir)
+        desired_files = [str(self._data_dir / name) for name in WATCHED_FILES if (self._data_dir / name).exists()]
+        current_files = self._watcher.files()
+        if current_files:
+            self._watcher.removePaths(current_files)
+        current_dirs = self._watcher.directories()
+        if current_dirs:
+            self._watcher.removePaths(current_dirs)
+        if desired_files:
+            self._watcher.addPaths(desired_files)
+        self._watcher.addPath(directory)
+
+    def _on_watched_file_changed(self, path: str) -> None:
+        self._watch_dirty.add(Path(path).name)
+        self._watch_debounce.start(WATCH_DEBOUNCE_MS)
+
+    def _on_watched_directory_changed(self, _path: str) -> None:
+        self._watch_dirty.update(WATCHED_FILES)
+        self._watch_debounce.start(WATCH_DEBOUNCE_MS)
+
+    def _flush_watched_changes(self) -> None:
+        dirty = set(self._watch_dirty)
+        self._watch_dirty.clear()
+        if not dirty or not self._store:
+            return
+        if "usage.jsonl" in dirty and not self._store.usage_changed():
+            dirty.remove("usage.jsonl")
+        if not dirty:
+            return
+        self._store.invalidate(*dirty)
+        if "usage.jsonl" in dirty and self._store.usage_wait_ms() > 0:
+            self._refresh()
+            self._usage_deferred.start(self._store.usage_wait_ms())
+        else:
+            self._refresh(force_usage="usage.jsonl" in dirty)
+        self._configure_watchers()
+
+    def _update_quota_display(self, snap: Dict[str, Any]) -> None:
+        if is_free_plan(snap.get("plan")):
+            self._short_bar.set_unavailable()
+            self._weekly_bar.set_unavailable()
+        else:
+            self._short_bar.set_value(snap["short_percent"], snap["short_reset"])
+            self._weekly_bar.set_value(snap["weekly_percent"], snap["weekly_reset"])
+        self._update_big_numbers(snap)
+
+    def _refresh(self, force_usage: bool = False) -> None:
         if not self._store:
             return
         try:
@@ -756,7 +1127,7 @@ class UsageCard(QMainWindow):
             if self._account_index >= len(self._accounts):
                 self._account_index = 0
             shown_id = self._accounts[self._account_index]["id"] if self._accounts else None
-            snap = self._store.snapshot(shown_id)
+            snap = self._store.snapshot(shown_id, force_usage=force_usage)
         except Exception as e:
             self._status_label.setText(f"读取错误: {type(e).__name__}")
             return
@@ -766,14 +1137,15 @@ class UsageCard(QMainWindow):
         accent = THEMES[self._theme_key]["accent"]
         muted = THEMES[self._theme_key]["muted"]
         dot_color = accent if snap["is_active"] else muted
-        active_mark = " · 当前" if snap["is_active"] else ""
+        active_mark = (
+            f" <span style='color:{accent}; font-weight:800;'>· 当前</span>"
+            if snap["is_active"] else ""
+        )
         self._plan_label.setText(
             f"<span style='color:{dot_color}; font-weight:600;'>●</span> {str(plan).upper()}{active_mark}"
         )
 
-        self._short_bar.set_value(snap["short_percent"], snap["short_reset"])
-        self._weekly_bar.set_value(snap["weekly_percent"], snap["weekly_reset"])
-        self._update_big_numbers(snap)
+        self._update_quota_display(snap)
         self._update_detail(snap)
 
         t = snap["today"]
@@ -782,7 +1154,10 @@ class UsageCard(QMainWindow):
         self._cache_label.setText(human_bytes(t.tokens_cached))
 
         self._last_snap = snap
+        self._update_big_countdowns(snap)
 
+        self._update_reset_credits(snap)
+        self._schedule_countdown_refresh()
         # 账号切换按钮：多账号才显示
         multi = len(self._accounts) > 1
         self._prev_btn.setVisible(multi)
@@ -792,13 +1167,40 @@ class UsageCard(QMainWindow):
             f"更新 {datetime.now().strftime('%H:%M:%S')} · {self._data_dir.name if self._data_dir else '—'}/"
         )
 
-    def _tick(self) -> None:
+    def _schedule_countdown_refresh(self) -> None:
+        if not hasattr(self, "_countdown_timer"):
+            self._countdown_timer = QTimer(self)
+            self._countdown_timer.setSingleShot(True)
+            self._countdown_timer.timeout.connect(self._refresh_countdowns)
+        timestamps: List[float] = []
+        if self._last_snap:
+            if not is_free_plan(self._last_snap.get("plan")):
+                timestamps.extend(value for value in (
+                    self._last_snap.get("short_reset"), self._last_snap.get("weekly_reset"),
+                ) if isinstance(value, (int, float)) and value > time.time())
+            timestamps.extend(item["expires_at"] for item in self._last_snap.get("reset_credit_details", []) if item.get("expires_at", 0) > time.time())
+        delay = min((countdown_refresh_delay(value - time.time()) for value in timestamps), default=WATCH_HEALTH_MS)
+        self._countdown_timer.start(delay)
+
+    def _refresh_countdowns(self) -> None:
         self._short_bar.tick()
         self._weekly_bar.tick()
+        if self._last_snap is not None:
+            self._update_big_countdowns(self._last_snap)
+            self._update_reset_credits(self._last_snap)
+        self._schedule_countdown_refresh()
 
     # ---------- 交互 ----------
 
     def _update_big_numbers(self, snap: Dict[str, Any]) -> None:
+        if is_free_plan(snap.get("plan")):
+            for lbl in (self._big_short, self._big_weekly):
+                lbl.setText("无额度")
+                lbl.setStyleSheet(
+                    f"color:{THEMES[self._theme_key]['muted']}; font-weight:800; font-size:22pt;"
+                )
+            return
+
         now = time.time()
 
         def _remain(p: Any, reset_ts: Any) -> int:
@@ -820,6 +1222,84 @@ class UsageCard(QMainWindow):
             r = _remain(pct, rts)
             lbl.setText(f"{r}%")
             lbl.setStyleSheet(f"color:{_remain_color(r)}; font-weight:800; font-size:22pt;")
+
+    def _update_big_countdowns(self, snap: Dict[str, Any]) -> None:
+        if is_free_plan(snap.get("plan")):
+            for label in self._big_reset_labels:
+                label.clear()
+            return
+        for label, reset_ts, period in (
+            (self._big_reset_labels[0], snap["short_reset"], 5 * 3600),
+            (self._big_reset_labels[1], snap["weekly_reset"], 7 * 24 * 3600),
+        ):
+            label.setText(reset_countdown(reset_ts, period))
+
+    def _update_reset_credits(self, snap: Dict[str, Any]) -> None:
+        details = snap.get("reset_credit_details", [])
+        try:
+            credit_count = max(0, int(snap.get("reset_credits") or 0))
+        except (TypeError, ValueError):
+            credit_count = 0
+        summary = "重置额度  暂无" if not credit_count else f"重置额度  {credit_count} 次"
+        earliest = min(
+            (item.get("expires_at") for item in details if item.get("expires_at") is not None),
+            default=None,
+        )
+        date, remaining = format_credit_expiry_parts(earliest)
+        expiry = f"最早到期  {date}"
+        if remaining:
+            expiry = f"{expiry} · {remaining}"
+        status = format_reset_credit_status(
+            snap.get("reset_credit_updated"),
+            snap.get("reset_credit_failed"),
+            str(snap.get("reset_credit_notice") or ""),
+        )
+        if status.startswith("最近同步 "):
+            status = f"同步 {status.removeprefix('最近同步 ')}"
+        self._credit_summary_label.setText(summary)
+        self._credit_expiry_label.setText(expiry)
+        self._reset_credit_status_label.setText(status)
+        self._big_credit_label.setText(summary)
+        self._big_credit_expiry_label.setText(expiry)
+        self._big_credit_status_label.setText(status)
+        has_details = bool(details)
+        for toggle in (self._credit_toggle, self._big_credit_toggle):
+            toggle.setEnabled(has_details)
+            toggle.setText("⌃" if self._credit_expanded else "⌄")
+            toggle.setToolTip("收起重置额度详情" if self._credit_expanded else "展开重置额度详情")
+        if self._credit_expanded and has_details:
+            self._credit_details_title.setText(f"额度明细  ·  {len(details)} 项")
+            for index, (row, _number, date_label, remaining_label) in enumerate(self._credit_detail_rows):
+                if index < len(details):
+                    date, remaining = format_credit_expiry_parts(details[index].get("expires_at"))
+                    date_label.setText(date)
+                    remaining_label.setText(remaining)
+                    row.setVisible(True)
+                else:
+                    row.setVisible(False)
+        else:
+            for row, _number, date_label, remaining_label in self._credit_detail_rows:
+                date_label.setText("")
+                remaining_label.setText("")
+                row.setVisible(False)
+        show_details = self._credit_expanded and has_details
+        self._credit_details.setVisible(show_details)
+        self._ensure_credit_details_fit(show_details)
+
+    def _ensure_credit_details_fit(self, expanded: bool) -> None:
+        minimum_height = MIN_SIZE[1]
+        if expanded:
+            minimum_height = max(minimum_height, self.minimumSizeHint().height())
+        self.setMinimumHeight(minimum_height)
+        if expanded and self.height() < minimum_height:
+            self.resize(self.width(), minimum_height)
+
+    def _toggle_credit_details(self) -> None:
+        if not self._last_snap or not self._last_snap.get("reset_credit_details"):
+            return
+        self._credit_expanded = not self._credit_expanded
+        self._update_reset_credits(self._last_snap)
+        self._save_state()
 
     def _update_detail(self, snap: Dict[str, Any]) -> None:
         if not self._detail.isVisible():
@@ -912,7 +1392,13 @@ class UsageCard(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._save_state()
-        super().closeEvent(event)
+        # Qt.Tool windows do not necessarily count as the application's last
+        # primary window. Exit explicitly so the hidden event loop (and the
+        # PyInstaller one-file launcher waiting for it) cannot remain alive.
+        event.accept()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
 
 # ──────────────────────────────── 入口 ────────────────────────────────
